@@ -1,0 +1,241 @@
+﻿import json
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from sqlalchemy import text
+
+from .config import ConfigStore, DBConfig as StoredDBConfig
+from .db import DBConfig, get_engine, validate_sql
+from .fs_ops import FileSandbox
+from .llm_client import LLMClient
+from .memory import MemoryStore
+from .metadata import MetadataStore
+
+
+@dataclass
+class AgentSettings:
+    max_iters: int = 3
+    max_llm_calls: int = 6
+    memory_window: int = 15
+    summarize_every: int = 20
+
+
+class Agent:
+    def __init__(self, workdir: Path) -> None:
+        self.workdir = workdir
+        self.config_store = ConfigStore()
+        self.memory = MemoryStore()
+        self.metadata = MetadataStore()
+        self.metadata.load()
+        self.fs = FileSandbox(workdir)
+        self.llm = LLMClient()
+        self.settings = AgentSettings()
+
+    def status(self) -> str:
+        cfg = self.config_store.load()
+        msg_count = self.memory.count_messages()
+        tables_loaded = len(self.metadata.list_tables())
+        return (
+            f"DB config complete: {cfg.is_complete()}\n"
+            f"Messages stored: {msg_count}\n"
+            f"Tables metadata loaded: {tables_loaded}"
+        )
+
+    def reset(self) -> None:
+        self.memory.reset()
+
+    def _maybe_summarize(self) -> None:
+        count = self.memory.count_messages()
+        if count > 0 and count % self.settings.summarize_every == 0:
+            summary = self.memory.get_summary()
+            recent = self.memory.get_recent(self.settings.memory_window)
+            convo = "\n".join([f"{m.role}: {m.content}" for m in recent])
+            prompt = (
+                "Ты ассистент. Обнови краткую выжимку диалога.\n"
+                f"Текущая выжимка: {summary}\n"
+                f"Новые сообщения:\n{convo}\n"
+                "Верни обновленную выжимку 5-10 предложений."
+            )
+            resp = self.llm.invoke(prompt)
+            text = getattr(resp, "content", str(resp))
+            self.memory.set_summary(text)
+
+    def _build_context(self, extra: str = "") -> str:
+        summary = self.memory.get_summary()
+        recent = self.memory.get_recent(self.settings.memory_window)
+        convo = "\n".join([f"{m.role}: {m.content}" for m in recent])
+        meta_hint = ""
+        if self.metadata.tables_df is not None:
+            meta_hint = "Доступны таблицы и атрибуты из CSV метаданных."
+        return (
+            f"Краткая память: {summary}\n"
+            f"Последние сообщения:\n{convo}\n"
+            f"Метаданные: {meta_hint}\n"
+            f"Ошибки и замечания: {extra}\n"
+        )
+
+    def _json_from_response(self, text: str) -> Optional[Dict[str, Any]]:
+        match = re.search(r"\{.*\}", text, flags=re.S)
+        if not match:
+            return None
+        try:
+            return json.loads(match.group(0))
+        except Exception:
+            return None
+
+    def _plan_prompt(self, user_text: str, context: str) -> str:
+        return (
+            "Ты агент по работе с БД и файлами. Сначала составь план.\n"
+            f"Контекст:\n{context}\n"
+            f"Запрос пользователя: {user_text}\n"
+            "Верни план в виде нумерованного списка (3-6 пунктов)."
+        )
+
+    def _action_prompt(self, user_text: str, plan: str, context: str) -> str:
+        return (
+            "Ты агент по работе с БД, SQL и файловой системой.\n"
+            "Сформируй действие в JSON.\n"
+            "Формат JSON:\n"
+            "{\n"
+            "  \"type\": \"sql|fs|answer|model_design|question\",\n"
+            "  \"content\": \"текст ответа/пояснение\",\n"
+            "  \"sql\": \"SQL если type=sql\",\n"
+            "  \"run_sql\": true/false,\n"
+            "  \"fs_ops\": [\n"
+            "     {\"op\": \"read|write|mkdir|rm|ls\", \"path\": \"...\", \"content\": \"...\"}\n"
+            "  ]\n"
+            "}\n"
+            "Правила:\n"
+            "- Если нужен SQL, помести его в поле sql.\n"
+            "- Для файловых операций используй fs_ops.\n"
+            "- Если нужна доп. инфо от пользователя, type=question.\n"
+            f"Контекст:\n{context}\n"
+            f"План:\n{plan}\n"
+            f"Запрос пользователя: {user_text}\n"
+        )
+
+    def _fix_sql_prompt(self, user_text: str, bad_sql: str, error: str, context: str) -> str:
+        return (
+            "Исправь SQL запрос.\n"
+            f"Ошибка: {error}\n"
+            f"Плохой SQL:\n{bad_sql}\n"
+            f"Контекст:\n{context}\n"
+            f"Запрос пользователя: {user_text}\n"
+            "Верни только исправленный SQL без пояснений."
+        )
+
+    def _execute_fs_ops(self, ops: List[Dict[str, Any]]) -> List[str]:
+        results = []
+        for op in ops:
+            action = op.get("op")
+            path = op.get("path", "")
+            if action == "read":
+                results.append(self.fs.read_text(path))
+            elif action == "write":
+                self.fs.write_text(path, op.get("content", ""))
+                results.append(f"written: {path}")
+            elif action == "mkdir":
+                self.fs.mkdir(path)
+                results.append(f"mkdir: {path}")
+            elif action == "rm":
+                self.fs.rm(path)
+                results.append(f"rm: {path}")
+            elif action == "ls":
+                results.append("\n".join(self.fs.ls(path)))
+        return results
+
+    def handle_user_message(self, user_text: str) -> str:
+        self.memory.add_message("user", user_text)
+        self._maybe_summarize()
+
+        cfg = self.config_store.load()
+        feedback = ""
+        context = self._build_context(feedback)
+        plan_resp = self.llm.invoke(self._plan_prompt(user_text, context))
+        plan = getattr(plan_resp, "content", str(plan_resp))
+
+        llm_calls = 1
+        last_error = ""
+        for _ in range(self.settings.max_iters):
+            if llm_calls >= self.settings.max_llm_calls:
+                break
+            context = self._build_context(feedback)
+            action_resp = self.llm.invoke(self._action_prompt(user_text, plan, context))
+            llm_calls += 1
+            action_text = getattr(action_resp, "content", str(action_resp))
+            action = self._json_from_response(action_text)
+            if not action:
+                last_error = "LLM did not return valid JSON"
+                feedback = last_error
+                continue
+
+            action_type = action.get("type", "answer")
+            if action_type == "question":
+                reply = action.get("content", "")
+                self.memory.add_message("assistant", reply)
+                return reply
+
+            if action_type == "fs":
+                try:
+                    results = self._execute_fs_ops(action.get("fs_ops", []))
+                    reply = action.get("content", "") + "\n" + "\n".join(results)
+                except Exception as e:
+                    last_error = str(e)
+                    feedback = last_error
+                    continue
+                self.memory.add_message("assistant", reply)
+                return reply
+
+            if action_type == "sql":
+                sql_text = action.get("sql", "").strip()
+                if not sql_text:
+                    last_error = "SQL missing"
+                    feedback = last_error
+                    continue
+                if not cfg.is_complete():
+                    reply = "Нет настроек БД. Запусти команду config."
+                    self.memory.add_message("assistant", reply)
+                    return reply
+                engine = get_engine(DBConfig(cfg.user_id, cfg.host, cfg.port, cfg.base))
+                ok, err = validate_sql(engine, sql_text)
+                if not ok:
+                    fix_resp = self.llm.invoke(
+                        self._fix_sql_prompt(user_text, sql_text, err or "", context)
+                    )
+                    llm_calls += 1
+                    sql_text = getattr(fix_resp, "content", str(fix_resp)).strip()
+                    ok, err = validate_sql(engine, sql_text)
+                    if not ok:
+                        last_error = err or "SQL validation failed"
+                        feedback = last_error
+                        continue
+                run_sql = bool(action.get("run_sql", False))
+                if run_sql:
+                    try:
+                        engine = get_engine(DBConfig(cfg.user_id, cfg.host, cfg.port, cfg.base))
+                        with engine.connect() as conn:
+                            conn.execute(text(sql_text))
+                        execution_note = "\n\nSQL выполнен."
+                    except Exception as e:
+                        last_error = f"SQL execution failed: {e}"
+                        feedback = last_error
+                        continue
+                else:
+                    execution_note = ""
+                reply = action.get("content", "")
+                reply = (reply + execution_note + "\n\nSQL:\n" + sql_text).strip()
+                self.memory.add_message("assistant", reply)
+                return reply
+
+            reply = action.get("content", "")
+            self.memory.add_message("assistant", reply)
+            return reply
+
+        fallback = (
+            "Не удалось получить корректный результат. "
+            f"Последняя ошибка: {last_error}"
+        )
+        self.memory.add_message("assistant", fallback)
+        return fallback
