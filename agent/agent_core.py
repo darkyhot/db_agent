@@ -1,4 +1,4 @@
-﻿import json
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -100,18 +100,25 @@ class Agent:
             "Сформируй действие в JSON.\n"
             "Формат JSON:\n"
             "{\n"
-            "  \"type\": \"sql|fs|answer|model_design|question\",\n"
-            "  \"content\": \"текст ответа/пояснение\",\n"
-            "  \"sql\": \"SQL если type=sql\",\n"
-            "  \"run_sql\": true/false,\n"
-            "  \"fs_ops\": [\n"
-            "     {\"op\": \"read|write|mkdir|rm|ls\", \"path\": \"...\", \"content\": \"...\"}\n"
-            "  ]\n"
-            "}\n"
-            "Правила:\n"
-            "- Если нужен SQL, помести его в поле sql.\n"
-            "- Для файловых операций используй fs_ops.\n"
-            "- Если нужна доп. инфо от пользователя, type=question.\n"
+            '  "type": "sql|fs|answer|model_design|question",\n'
+            '  "content": "ответ пользователю",\n'
+            '  "sql": "SQL код",\n'
+            '  "run_sql": true/false,\n'
+            '  "show_sql": true/false,\n'
+            '  "output_file": "путь/к/file.csv",\n'
+            '  "fs_ops": [{"op": "...", "path": "..."}]\n'
+            "}\n\n"
+            "ПРАВИЛА:\n"
+            "1. ОБЫЧНЫЙ ВОПРОС (например 'сколько заказов'):\n"
+            "   - type='sql', run_sql=true, show_sql=false\n"
+            "   - отвечай просто результатом, без SQL\n\n"
+            "2. ПРОСЯТ ПОКАЗАТЬ SQL:\n"
+            "   - show_sql=true (SQL добавится к ответу)\n\n"
+            "3. ПРОСЯТ ФАЙЛ ('сохрани', 'выгрузи в CSV'):\n"
+            "   - output_file='путь/к/файлу.csv'\n"
+            "   - файл создается автоматически\n\n"
+            "4. ФАЙЛОВЫЕ ОПЕРАЦИИ:\n"
+            "   - fs_ops для mkdir, ls и т.д.\n\n"
             f"Контекст:\n{context}\n"
             f"План:\n{plan}\n"
             f"Запрос пользователя: {user_text}\n"
@@ -212,14 +219,17 @@ class Agent:
                         last_error = err or "SQL validation failed"
                         feedback = last_error
                         continue
+                
                 run_sql = bool(action.get("run_sql", False))
+                show_sql = bool(action.get("show_sql", False))
                 output_file = action.get("output_file", "")
+                
                 if run_sql:
                     try:
                         engine = get_engine(DBConfig(cfg.user_id, cfg.host, cfg.port, cfg.base))
                         with engine.connect() as conn:
                             result = conn.execute(text(sql_text))
-                            # Проверяем, есть ли результат (SELECT)
+                            # SELECT - получаем данные
                             if result.returns_rows:
                                 rows = result.fetchall()
                                 columns = result.keys()
@@ -228,26 +238,34 @@ class Agent:
                                 for row in rows:
                                     csv_lines.append(";".join(str(cell) for cell in row))
                                 csv_content = "\n".join(csv_lines)
-                                # Сохраняем в файл если указан или по умолчанию
-                                if not output_file:
-                                    output_file = f"query_result_{self.memory.count_messages()}.csv"
-                                self.fs.write_text(output_file, csv_content)
-                                execution_note = f"\n\nSQL выполнен. Результат: {len(rows)} строк. Сохранено в {output_file}"
-                                # Показываем первые 20 строк пользователю
-                                preview = "\n".join(csv_lines[:21])  # header + 20 строк
-                                if len(rows) > 20:
-                                    preview += f"\n... и ещё {len(rows)-20} строк"
-                                execution_note += f"\n\nПревью данных:\n{preview}"
+                                # Сохраняем в файл если просили
+                                if output_file:
+                                    self.fs.write_text(output_file, csv_content)
+                                    file_note = f"\n📁 Сохранено в: {output_file}"
+                                else:
+                                    file_note = ""
+                                # Формируем ответ
+                                row_count = len(rows)
+                                preview_lines = csv_lines[:21]  # заголовок + 20
+                                preview = "\n".join(preview_lines)
+                                if row_count > 20:
+                                    preview += f"\n... и ещё {row_count - 20} записей"
+                                
+                                reply = f"Найдено {row_count} записей.{file_note}\n\n```\n{preview}\n```"
                             else:
-                                execution_note = "\n\nSQL выполнен (изменение данных)."
+                                # INSERT/UPDATE/DELETE
+                                reply = "✅ SQL выполнен (изменение данных)."
                     except Exception as e:
                         last_error = f"SQL execution failed: {e}"
                         feedback = last_error
                         continue
                 else:
-                    execution_note = ""
-                reply = action.get("content", "")
-                reply = (reply + execution_note + "\n\nSQL:\n" + sql_text).strip()
+                    reply = action.get("content", "")
+                
+                # Добавляем SQL если явно просили
+                if show_sql:
+                    reply = reply + f"\n\n**SQL:**\n```sql\n{sql_text}\n```"
+                
                 self.memory.add_message("assistant", reply)
                 return reply
 
