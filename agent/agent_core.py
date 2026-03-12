@@ -213,12 +213,33 @@ class Agent:
                         feedback = last_error
                         continue
                 run_sql = bool(action.get("run_sql", False))
+                output_file = action.get("output_file", "")
                 if run_sql:
                     try:
                         engine = get_engine(DBConfig(cfg.user_id, cfg.host, cfg.port, cfg.base))
                         with engine.connect() as conn:
-                            conn.execute(text(sql_text))
-                        execution_note = "\n\nSQL выполнен."
+                            result = conn.execute(text(sql_text))
+                            # Проверяем, есть ли результат (SELECT)
+                            if result.returns_rows:
+                                rows = result.fetchall()
+                                columns = result.keys()
+                                # Формируем CSV
+                                csv_lines = [";".join(columns)]
+                                for row in rows:
+                                    csv_lines.append(";".join(str(cell) for cell in row))
+                                csv_content = "\n".join(csv_lines)
+                                # Сохраняем в файл если указан или по умолчанию
+                                if not output_file:
+                                    output_file = f"query_result_{self.memory.count_messages()}.csv"
+                                self.fs.write_text(output_file, csv_content)
+                                execution_note = f"\n\nSQL выполнен. Результат: {len(rows)} строк. Сохранено в {output_file}"
+                                # Показываем первые 20 строк пользователю
+                                preview = "\n".join(csv_lines[:21])  # header + 20 строк
+                                if len(rows) > 20:
+                                    preview += f"\n... и ещё {len(rows)-20} строк"
+                                execution_note += f"\n\nПревью данных:\n{preview}"
+                            else:
+                                execution_note = "\n\nSQL выполнен (изменение данных)."
                     except Exception as e:
                         last_error = f"SQL execution failed: {e}"
                         feedback = last_error
