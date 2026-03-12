@@ -193,32 +193,37 @@ class Agent:
 
     def _check_and_deduplicate_joins(self, sql_text: str, engine) -> str:
         """Проверяет JOIN на дубликаты и автоматически исправляет."""
-        # Находим все JOIN table ON condition
-        join_pattern = r'JOIN\s+(\w+\.\w+|\w+)\s+(?:AS\s+)?(\w+)?\s*ON\s+([^=\s]+)\s*=\s*([^\s]+)'
+        # Упрощенный regex: находим JOIN table ON condition
+        join_pattern = r'JOIN\s+(\w+(?:\.\w+)?)\s+ON\s+([^=\s]+)\s*=\s*([^\s)]+)'
         matches = list(re.finditer(join_pattern, sql_text, re.IGNORECASE))
-        
+
         if not matches:
             return sql_text
-        
+
         modified_sql = sql_text
         for match in matches:
             full_match = match.group(0)
             table_name = match.group(1)
-            alias = match.group(2) or table_name.split('.')[-1][0].lower()
-            left_key = match.group(3)
-            right_key = match.group(4)
-            
+            left_key = match.group(2)
+            right_key = match.group(3)
+
+            # Определяем alias и ключ
+            if '.' in table_name:
+                alias = table_name.split('.')[-1][:3].lower()
+            else:
+                alias = table_name[:3].lower()
+
             # Определяем ключ в справочнике
             if '.' in right_key:
                 ref_key = right_key.split('.')[-1]
             else:
                 ref_key = right_key
-            
+
             try:
                 with engine.connect() as conn:
                     # Проверяем есть ли дубликаты
                     check_sql = f"""
-                        SELECT COUNT(*) as total, COUNT(DISTINCT {ref_key}) as unique_count 
+                        SELECT COUNT(*) as total, COUNT(DISTINCT {ref_key}) as unique_count
                         FROM {table_name}
                     """
                     result = conn.execute(text(check_sql))
@@ -226,14 +231,14 @@ class Agent:
                     if row is None:
                         continue
                     total, unique = row[0], row[1]
-                    
+
                     if total != unique:
                         # Есть дубликаты! Оборачиваем в подзапрос
                         new_join = f"JOIN (SELECT DISTINCT * FROM {table_name}) AS {alias} ON {left_key} = {alias}.{ref_key}"
                         modified_sql = modified_sql.replace(full_match, new_join)
             except Exception:
                 continue
-        
+
         return modified_sql
 
     def _execute_sql(self, sql_text: str, show_sql: bool, output_file: Optional[str]) -> Tuple[str, str]:
@@ -303,38 +308,41 @@ class Agent:
         executed_steps = []
         all_results = []
         last_error = ""
-        
+        done = False
+
         for iteration in range(self.settings.max_iters):
             if llm_calls >= self.settings.max_llm_calls:
                 break
-            
+
             context = self._build_context(feedback)
             action_resp = self.llm.invoke(
                 self._action_prompt(user_text, plan, context, executed_steps)
             )
             llm_calls += 1
-            
+
             action_text = getattr(action_resp, "content", str(action_resp))
             action = self._json_from_response(action_text)
-            
+
             if not action:
                 last_error = "LLM did not return valid JSON"
                 feedback = last_error
                 continue
-            
+
             action_type = action.get("type", "answer")
-            
+
             # type='done' завершает цикл
             if action_type == "done":
+                done = True
                 break
-            
+
             # type='question' - собираем результат и завершаем
             if action_type == "question":
                 reply = action.get("content", "")
                 all_results.append(reply)
                 executed_steps.append("Задан вопрос пользователю")
+                done = True
                 break
-            
+
             # Файловые операции
             if action_type == "fs":
                 try:
@@ -342,11 +350,16 @@ class Agent:
                     step_result = action.get("content", "") + "\n" + "\n".join(results)
                     executed_steps.append(f"Файловые операции: {len(action.get('fs_ops', []))} шт.")
                     all_results.append(step_result)
+                    # Проверяем, все ли шаги выполнены
+                    if action.get("is_final") or len(executed_steps) >= 3:
+                        done = True
+                        break
+                    continue
                 except Exception as e:
                     last_error = str(e)
                     feedback = last_error
-                continue
-            
+                    continue
+
             # SQL
             if action_type == "sql":
                 sql_text = action.get("sql", "").strip()
@@ -354,11 +367,12 @@ class Agent:
                     last_error = "SQL missing"
                     feedback = last_error
                     continue
-                
+
                 if not cfg.is_complete():
                     all_results.append("Нет настроек БД. Запусти команду config.")
+                    done = True
                     break
-                
+
                 engine = get_engine(DBConfig(cfg.user_id, cfg.host, cfg.port, cfg.base))
                 ok, err = validate_sql(engine, sql_text)
                 if not ok:
@@ -372,11 +386,11 @@ class Agent:
                         last_error = err or "SQL validation failed"
                         feedback = last_error
                         continue
-                
+
                 run_sql = bool(action.get("run_sql", False))
                 show_sql = bool(action.get("show_sql", False))
                 output_file = action.get("output_file", "")
-                
+
                 if run_sql:
                     reply, error = self._execute_sql(sql_text, show_sql, output_file if output_file else None)
                     if error:
@@ -390,20 +404,24 @@ class Agent:
                     reply = f"**SQL:**\n```sql\n{sql_text}\n```"
                     executed_steps.append("Показан SQL (без выполнения)")
                     all_results.append(reply)
-                
-                continue
-            
+
+                # SQL выполнен успешно - завершаем цикл
+                done = True
+                break
+
             # Обычный ответ (type='answer' или другие)
             reply = action.get("content", "")
             executed_steps.append("Ответ пользователю")
             all_results.append(reply)
-        
+            done = True
+            break
+
         # Формируем итоговый ответ ПОСЛЕ цикла
         if all_results:
             final_reply = "\n\n---\n\n".join(all_results)
             self.memory.add_message("assistant", final_reply)
             return final_reply
-        
+
         fallback = (
             "Не удалось получить корректный результат. "
             f"Последняя ошибка: {last_error}"
