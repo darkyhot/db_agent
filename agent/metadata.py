@@ -102,3 +102,17 @@ class MetadataStore:
             "table": table_info,
             "columns": attrs,
         }
+
+    def get_schema_summary(self) -> str:
+        """Возвращает краткое описание схемы БД для контекста LLM."""
+        parts: List[str] = []
+        for key, table_info in sorted(self._table_index.items()):
+            attrs = self._attr_index.get(key, [])
+            cols_str = ", ".join([
+                f"{a.column_name}({a.dtype})" for a in attrs[:10]  # ограничиваем 10 колонками
+            ])
+            if len(attrs) > 10:
+                cols_str += f", ... (+{len(attrs)-10} колонок)"
+            desc = f" - {table_info.description}" if table_info.description else ""
+            parts.append(f"{key}: {cols_str}{desc}")
+        return "\n".join(parts)
