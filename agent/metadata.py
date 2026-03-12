@@ -38,9 +38,9 @@ class MetadataStore:
         tables_path = self.data_dir / "tables_list.csv"
         attrs_path = self.data_dir / "attr_list.csv"
         if tables_path.exists():
-            self.tables_df = pd.read_csv(tables_path, dtype=str, low_memory=False)
+            self.tables_df = pd.read_csv(tables_path, dtype=str, low_memory=False, sep=";")
         if attrs_path.exists():
-            self.attrs_df = pd.read_csv(attrs_path, dtype=str, low_memory=False)
+            self.attrs_df = pd.read_csv(attrs_path, dtype=str, low_memory=False, sep=";")
         self._build_indexes()
 
     def _build_indexes(self) -> None:
