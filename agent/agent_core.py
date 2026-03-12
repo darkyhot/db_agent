@@ -62,14 +62,44 @@ class Agent:
             text = getattr(resp, "content", str(resp))
             self.memory.set_summary(text)
 
+    def _get_table_samples(self) -> str:
+        """Получает примеры данных из таблиц для контекста."""
+        cfg = self.config_store.load()
+        if not cfg.is_complete():
+            return ""
+        try:
+            engine = get_engine(DBConfig(cfg.user_id, cfg.host, cfg.port, cfg.base))
+            samples = []
+            for table_info in list(self.metadata._table_index.values())[:3]:  # max 3 таблицы
+                key = f"{table_info.schema_name}.{table_info.table_name}"
+                try:
+                    with engine.connect() as conn:
+                        result = conn.execute(text(f'SELECT * FROM {key} LIMIT 3'))
+                        rows = result.fetchall()
+                        if rows:
+                            cols = result.keys()
+                            lines = [";".join(cols)]
+                            for row in rows:
+                                lines.append(";".join(str(c)[:50] for c in row))  # обрезаем длинные строки
+                            samples.append(f"{key} (первые 3 строки):\n" + "\n".join(lines))
+                except Exception:
+                    continue
+            return "\n\n".join(samples) if samples else ""
+        except Exception:
+            return ""
+
     def _build_context(self, extra: str = "") -> str:
         summary = self.memory.get_summary()
         recent = self.memory.get_recent(self.settings.memory_window)
         convo = "\n".join([f"{m.role}: {m.content}" for m in recent])
         meta_hint = ""
+        samples = ""
         if self.metadata.tables_df is not None:
             schema_summary = self.metadata.get_schema_summary()
             meta_hint = f"Доступны таблицы и атрибуты из CSV метаданных.\nСхема БД:\n{schema_summary}"
+            samples = self._get_table_samples()
+            if samples:
+                meta_hint += f"\n\nПримеры реальных данных:\n{samples}"
         return (
             f"Краткая память: {summary}\n"
             f"Последние сообщения:\n{convo}\n"
@@ -119,6 +149,12 @@ class Agent:
             "   - файл создается автоматически\n\n"
             "4. ФАЙЛОВЫЕ ОПЕРАЦИИ:\n"
             "   - fs_ops для mkdir, ls и т.д.\n\n"
+            "ВАЖНЫЕ ПРАВИЛА ДЛЯ SQL:\n"
+            "- ПРОВЕРЯЙ существование полей в схеме выше!\n"
+            "- НЕ преобразовывай даты если поле уже в нужном формате (смотри Примеры данных)\n"
+            "- НЕ делай JOIN если справочник уже нормализован (данные уже есть в таблице)\n"
+            "- Для агрегации по месяцу: просто GROUP BY поле с месяцем, без DATE_TRUNC\n"
+            "- Если не уверен какое поле суммировать - спроси или посмотри описание в схеме\n\n"
             f"Контекст:\n{context}\n"
             f"План:\n{plan}\n"
             f"Запрос пользователя: {user_text}\n"
