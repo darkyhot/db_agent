@@ -108,11 +108,15 @@ class MetadataStore:
         parts: List[str] = []
         for key, table_info in sorted(self._table_index.items()):
             attrs = self._attr_index.get(key, [])
-            cols_str = ", ".join([
-                f"{a.column_name}({a.dtype})" for a in attrs[:10]  # ограничиваем 10 колонками
-            ])
+            # Добавляем описание таблицы если есть
+            table_desc = f" [{table_info.description}]" if table_info.description else ""
+            cols_info = []
+            for a in attrs[:10]:  # ограничиваем 10 колонками
+                # Добавляем описание колонки если есть
+                col_desc = f" - {a.description}" if a.description else ""
+                cols_info.append(f"{a.column_name}({a.dtype}){col_desc}")
+            cols_str = ", ".join(cols_info)
             if len(attrs) > 10:
                 cols_str += f", ... (+{len(attrs)-10} колонок)"
-            desc = f" - {table_info.description}" if table_info.description else ""
-            parts.append(f"{key}: {cols_str}{desc}")
+            parts.append(f"{key}{table_desc}: {cols_str}")
         return "\n".join(parts)
