@@ -2,7 +2,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import text
 
@@ -16,8 +16,8 @@ from .metadata import MetadataStore
 
 @dataclass
 class AgentSettings:
-    max_iters: int = 3
-    max_llm_calls: int = 6
+    max_iters: int = 5  # увеличил для множества действий
+    max_llm_calls: int = 10  # увеличил
     memory_window: int = 15
     summarize_every: int = 20
 
@@ -124,14 +124,15 @@ class Agent:
             "Верни план в виде нумерованного списка (3-6 пунктов)."
         )
 
-    def _action_prompt(self, user_text: str, plan: str, context: str) -> str:
+    def _action_prompt(self, user_text: str, plan: str, context: str, executed_steps: List[str]) -> str:
+        steps_done = "\n".join([f"{i+1}. {s}" for i, s in enumerate(executed_steps)]) if executed_steps else "Нет"
         return (
             "Ты агент по работе с БД, SQL и файловой системой.\n"
-            "Сформируй действие в JSON.\n"
+            "Сформируй ОДНО действие в JSON. Если нужно несколько действий - делай по одному за раз.\n"
             "Формат JSON:\n"
             "{\n"
-            '  "type": "sql|fs|answer|model_design|question",\n'
-            '  "content": "ответ пользователю",\n'
+            '  "type": "sql|fs|answer|model_design|question|done",\n'
+            '  "content": "ответ/пояснение",\n'
             '  "sql": "SQL код",\n'
             '  "run_sql": true/false,\n'
             '  "show_sql": true/false,\n'
@@ -139,29 +140,29 @@ class Agent:
             '  "fs_ops": [{"op": "...", "path": "..."}]\n'
             "}\n\n"
             "ПРАВИЛА:\n"
-            "1. ОБЫЧНЫЙ ВОПРОС (например 'сколько заказов'):\n"
-            "   - type='sql', run_sql=true, show_sql=false\n"
-            "   - отвечай просто результатом, без SQL\n\n"
-            "2. ПРОСЯТ ПОКАЗАТЬ SQL:\n"
-            "   - show_sql=true (SQL добавится к ответу)\n\n"
-            "3. ПРОСЯТ ФАЙЛ ('сохрани', 'выгрузи в CSV'):\n"
-            "   - output_file='путь/к/файлу.csv'\n"
-            "   - файл создается автоматически\n\n"
-            "4. ФАЙЛОВЫЕ ОПЕРАЦИИ:\n"
-            "   - fs_ops для mkdir, ls и т.д.\n\n"
-            "АНАЛИЗ ДАННЫХ - используй:\n"
-            "- Описания таблиц [в квадратных скобках] - что это за таблица\n"
-            "- Описания колонок - зачем нужно поле, что в нём хранится\n"
-            "- Примеры данных - реальные значения, форматы дат\n\n"
-            "ВАЖНЫЕ ПРАВИЛА ДЛЯ SQL:\n"
-            "- ПРОВЕРЯЙ существование полей в схеме выше!\n"
-            "- НЕ преобразовывай даты если поле уже в нужном формате (смотри Примеры данных)\n"
-            "- НЕ делай JOIN если справочник уже нормализован (данные уже есть в таблице)\n"
-            "- Для агрегации по месяцу: просто GROUP BY поле с месяцем, без DATE_TRUNC\n"
-            "- Если не уверен какое поле суммировать - посмотри описание поля в схеме\n\n"
+            "1. ОБЫЧНЫЙ ВОПРОС: type='sql', run_sql=true, show_sql=false\n"
+            "2. ПРОСЯТ ПОКАЗАТЬ SQL: show_sql=true\n"
+            "3. ПРОСЯТ ФАЙЛ: output_file='путь/к/файлу.csv'\n"
+            "4. type='done' - когда все шаги плана выполнены\n\n"
+            "АНАЛИЗ ДАННЫХ:\n"
+            "- Используй описания таблиц [в скобках] и колонок\n"
+            "- Примеры данных - реальные значения\n\n"
+            "ПРАВИЛА ДЛЯ SQL:\n"
+            "- Проверяй существование полей в схеме\n"
+            "- Не преобразовывай даты если поле уже в нужном формате\n"
+            "- Не делай JOIN если данные уже нормализованы\n"
+            "- **ВАЖНО: При JOIN справочников используй подзапрос с DISTINCT:**\n"
+            "  SELECT ... FROM table t\n"
+            "  JOIN (SELECT DISTINCT gosb_id, gosb_name FROM dim_gosb) d ON t.gosb_id = d.gosb_id\n"
+            "  Это предотвращает дублирование строк при множественных совпадениях\n"
+            "- Для агрегации по месяцу: GROUP BY поле_месяц (без DATE_TRUNC)\n"
+            "- При неуверенности смотри описание поля в схеме\n\n"}
+        # ... truncated for brevity
             f"Контекст:\n{context}\n"
             f"План:\n{plan}\n"
+            f"Уже выполнено:\n{steps_done}\n"
             f"Запрос пользователя: {user_text}\n"
+            "Следующий шаг (type='done' если всё готово):"
         )
 
     def _fix_sql_prompt(self, user_text: str, bad_sql: str, error: str, context: str) -> str:
@@ -194,48 +195,111 @@ class Agent:
                 results.append("\n".join(self.fs.ls(path)))
         return results
 
+    def _execute_sql(self, sql_text: str, show_sql: bool, output_file: Optional[str]) -> Tuple[str, str]:
+        """Выполняет SQL, возвращает (reply, error)."""
+        cfg = self.config_store.load()
+        if not cfg.is_complete():
+            return "Нет настроек БД. Запусти команду config.", ""
+        
+        engine = get_engine(DBConfig(cfg.user_id, cfg.host, cfg.port, cfg.base))
+        try:
+            with engine.connect() as conn:
+                result = conn.execute(text(sql_text))
+                if result.returns_rows:
+                    rows = result.fetchall()
+                    columns = result.keys()
+                    # CSV с запятой для данных
+                    csv_lines = [",".join(columns)]
+                    for row in rows:
+                        csv_lines.append(",".join(str(cell) for cell in row))
+                    csv_content = "\n".join(csv_lines)
+                    
+                    if output_file:
+                        self.fs.write_text(output_file, csv_content)
+                        file_note = f"\n📁 Сохранено в: {output_file}"
+                    else:
+                        file_note = ""
+                    
+                    row_count = len(rows)
+                    preview_lines = csv_lines[:21]
+                    preview = "\n".join(preview_lines)
+                    if row_count > 20:
+                        preview += f"\n... и ещё {row_count - 20} записей"
+                    
+                    reply = f"Найдено {row_count} записей.{file_note}\n\n```\n{preview}\n```"
+                else:
+                    reply = "✅ SQL выполнен (изменение данных)."
+                
+                if show_sql:
+                    reply = reply + f"\n\n**SQL:**\n```sql\n{sql_text}\n```"
+                
+                return reply, ""
+        except Exception as e:
+            return "", f"SQL execution failed: {e}"
+
     def handle_user_message(self, user_text: str) -> str:
         self.memory.add_message("user", user_text)
         self._maybe_summarize()
 
         cfg = self.config_store.load()
+        
+        # Получаем план
         feedback = ""
         context = self._build_context(feedback)
         plan_resp = self.llm.invoke(self._plan_prompt(user_text, context))
         plan = getattr(plan_resp, "content", str(plan_resp))
-
+        
+        # Выполняем шаги
         llm_calls = 1
+        executed_steps = []
+        all_results = []
         last_error = ""
-        for _ in range(self.settings.max_iters):
+        
+        for iteration in range(self.settings.max_iters):
             if llm_calls >= self.settings.max_llm_calls:
                 break
+            
             context = self._build_context(feedback)
-            action_resp = self.llm.invoke(self._action_prompt(user_text, plan, context))
+            action_resp = self.llm.invoke(
+                self._action_prompt(user_text, plan, context, executed_steps)
+            )
             llm_calls += 1
+            
             action_text = getattr(action_resp, "content", str(action_resp))
             action = self._json_from_response(action_text)
+            
             if not action:
                 last_error = "LLM did not return valid JSON"
                 feedback = last_error
                 continue
-
+            
             action_type = action.get("type", "answer")
+            
+            # Всё выполнено
+            if action_type == "done":
+                break
+            
+            # Нужна информация
             if action_type == "question":
                 reply = action.get("content", "")
                 self.memory.add_message("assistant", reply)
                 return reply
-
+            
+            # Файловые операции
             if action_type == "fs":
                 try:
                     results = self._execute_fs_ops(action.get("fs_ops", []))
-                    reply = action.get("content", "") + "\n" + "\n".join(results)
+                    step_result = action.get("content", "") + "\n" + "\n".join(results)
+                    executed_steps.append(f"Файловые операции: {len(action.get('fs_ops', []))} шт.")
+                    all_results.append(step_result)
                 except Exception as e:
                     last_error = str(e)
                     feedback = last_error
                     continue
-                self.memory.add_message("assistant", reply)
-                return reply
-
+                # Продолжаем выполнять следующие шаги
+                continue
+            
+            # SQL
             if action_type == "sql":
                 sql_text = action.get("sql", "").strip()
                 if not sql_text:
@@ -246,6 +310,7 @@ class Agent:
                     reply = "Нет настроек БД. Запусти команду config."
                     self.memory.add_message("assistant", reply)
                     return reply
+                
                 engine = get_engine(DBConfig(cfg.user_id, cfg.host, cfg.port, cfg.base))
                 ok, err = validate_sql(engine, sql_text)
                 if not ok:
@@ -265,54 +330,33 @@ class Agent:
                 output_file = action.get("output_file", "")
                 
                 if run_sql:
-                    try:
-                        engine = get_engine(DBConfig(cfg.user_id, cfg.host, cfg.port, cfg.base))
-                        with engine.connect() as conn:
-                            result = conn.execute(text(sql_text))
-                            # SELECT - получаем данные
-                            if result.returns_rows:
-                                rows = result.fetchall()
-                                columns = result.keys()
-                                # Формируем CSV
-                                csv_lines = [";".join(columns)]
-                                for row in rows:
-                                    csv_lines.append(";".join(str(cell) for cell in row))
-                                csv_content = "\n".join(csv_lines)
-                                # Сохраняем в файл если просили
-                                if output_file:
-                                    self.fs.write_text(output_file, csv_content)
-                                    file_note = f"\n📁 Сохранено в: {output_file}"
-                                else:
-                                    file_note = ""
-                                # Формируем ответ
-                                row_count = len(rows)
-                                preview_lines = csv_lines[:21]  # заголовок + 20
-                                preview = "\n".join(preview_lines)
-                                if row_count > 20:
-                                    preview += f"\n... и ещё {row_count - 20} записей"
-                                
-                                reply = f"Найдено {row_count} записей.{file_note}\n\n```\n{preview}\n```"
-                            else:
-                                # INSERT/UPDATE/DELETE
-                                reply = "✅ SQL выполнен (изменение данных)."
-                    except Exception as e:
-                        last_error = f"SQL execution failed: {e}"
+                    reply, error = self._execute_sql(sql_text, show_sql, output_file if output_file else None)
+                    if error:
+                        last_error = error
                         feedback = last_error
                         continue
+                    executed_steps.append(f"SQL: {sql_text[:50]}...")
+                    all_results.append(reply)
                 else:
-                    reply = action.get("content", "")
+                    # Только показать SQL без выполнения
+                    reply = f"**SQL:**\n```sql\n{sql_text}\n```"
+                    executed_steps.append(f"Показан SQL (без выполнения)")
+                    all_results.append(reply)
                 
-                # Добавляем SQL если явно просили
-                if show_sql:
-                    reply = reply + f"\n\n**SQL:**\n```sql\n{sql_text}\n```"
-                
-                self.memory.add_message("assistant", reply)
-                return reply
-
+                # Продолжаем
+                continue
+            
+            # Обычный ответ
             reply = action.get("content", "")
-            self.memory.add_message("assistant", reply)
-            return reply
-
+            executed_steps.append("Ответ пользователю")
+            all_results.append(reply)
+        
+        # Формируем итоговый ответ
+        if all_results:
+            final_reply = "\n\n---\n\n".join(all_results)
+            self.memory.add_message("assistant", final_reply)
+            return final_reply
+        
         fallback = (
             "Не удалось получить корректный результат. "
             f"Последняя ошибка: {last_error}"
