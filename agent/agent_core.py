@@ -68,9 +68,8 @@ class Agent:
         convo = "\n".join([f"{m.role}: {m.content}" for m in recent])
         meta_hint = ""
         if self.metadata.tables_df is not None:
-            tables = self.metadata.list_tables()
-            table_names = [f"{t.schema_name}.{t.table_name}" for t in tables]
-            meta_hint = f"Доступны таблицы и атрибуты из CSV метаданных.\nИзвестные таблицы: {', '.join(table_names)}"
+            schema_summary = self.metadata.get_schema_summary()
+            meta_hint = f"Доступны таблицы и атрибуты из CSV метаданных.\nСхема БД:\n{schema_summary}"
         return (
             f"Краткая память: {summary}\n"
             f"Последние сообщения:\n{convo}\n"
