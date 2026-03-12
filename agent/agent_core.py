@@ -16,8 +16,8 @@ from .metadata import MetadataStore
 
 @dataclass
 class AgentSettings:
-    max_iters: int = 5  # увеличил для множества действий
-    max_llm_calls: int = 10  # увеличил
+    max_iters: int = 5
+    max_llm_calls: int = 10
     memory_window: int = 15
     summarize_every: int = 20
 
@@ -70,7 +70,7 @@ class Agent:
         try:
             engine = get_engine(DBConfig(cfg.user_id, cfg.host, cfg.port, cfg.base))
             samples = []
-            for table_info in list(self.metadata._table_index.values())[:3]:  # max 3 таблицы
+            for table_info in list(self.metadata._table_index.values())[:3]:
                 key = f"{table_info.schema_name}.{table_info.table_name}"
                 try:
                     with engine.connect() as conn:
@@ -80,7 +80,7 @@ class Agent:
                             cols = result.keys()
                             lines = [";".join(cols)]
                             for row in rows:
-                                lines.append(";".join(str(c)[:50] for c in row))  # обрезаем длинные строки
+                                lines.append(";".join(str(c)[:50] for c in row))
                             samples.append(f"{key} (первые 3 строки):\n" + "\n".join(lines))
                 except Exception:
                     continue
@@ -153,8 +153,7 @@ class Agent:
             "- Не делай JOIN если данные уже нормализованы\n"
             "- При JOIN справочников: система автоматически проверит дубликаты\n"
             "- Для агрегации по месяцу: GROUP BY поле_месяц (без DATE_TRUNC)\n"
-            "- При неуверенности смотри описание поля в схеме\n\n"}
-        # ... truncated for brevity
+            "- При неуверенности смотри описание поля в схеме\n\n"
             f"Контекст:\n{context}\n"
             f"План:\n{plan}\n"
             f"Уже выполнено:\n{steps_done}\n"
@@ -193,10 +192,9 @@ class Agent:
         return results
 
     def _check_and_deduplicate_joins(self, sql_text: str, engine) -> str:
-        """Проверяет JOIN на дубликаты и автоматически добавляет DISTINCT если нужно."""
-        import re
+        """Проверяет JOIN на дубликаты и автоматически исправляет."""
         # Находим все JOIN table ON condition
-        join_pattern = r'JOIN\s+(\w+\.\w+|\w+)\s+(?:AS\s+)?(\w+)?\s*ON\s+([^\s]+)\s*=\s*([^\s]+)'
+        join_pattern = r'JOIN\s+(\w+\.\w+|\w+)\s+(?:AS\s+)?(\w+)?\s*ON\s+([^=\s]+)\s*=\s*([^\s]+)'
         matches = list(re.finditer(join_pattern, sql_text, re.IGNORECASE))
         
         if not matches:
@@ -210,7 +208,7 @@ class Agent:
             left_key = match.group(3)
             right_key = match.group(4)
             
-            # Определяем ключ в справочнике (обычно правый)
+            # Определяем ключ в справочнике
             if '.' in right_key:
                 ref_key = right_key.split('.')[-1]
             else:
@@ -218,28 +216,21 @@ class Agent:
             
             try:
                 with engine.connect() as conn:
-                    # Проверяем есть ли дубликаты в ключе справочника
+                    # Проверяем есть ли дубликаты
                     check_sql = f"""
                         SELECT COUNT(*) as total, COUNT(DISTINCT {ref_key}) as unique_count 
                         FROM {table_name}
                     """
                     result = conn.execute(text(check_sql))
                     row = result.fetchone()
+                    if row is None:
+                        continue
                     total, unique = row[0], row[1]
                     
                     if total != unique:
-                        # Есть дубликаты! Нужно обернуть в подзапрос
-                        # Получаем все колонки справочника
-                        cols_result = conn.execute(text(f"SELECT * FROM {table_name} LIMIT 0"))
-                        all_cols = cols_result.keys()
-                        
-                        # Создаем подзапрос с DISTINCT
-                        distinct_sql = f"(SELECT DISTINCT {ref_key}, {', '.join([c for c in all_cols if c != ref_key])} FROM {table_name})"
-                        
-                        # Заменяем в SQL
-                        old_join = full_match
-                        new_join = f"JOIN {distinct_sql} AS {alias} ON {left_key} = {alias}.{ref_key}"
-                        modified_sql = modified_sql.replace(old_join, new_join)
+                        # Есть дубликаты! Оборачиваем в подзапрос
+                        new_join = f"JOIN (SELECT DISTINCT * FROM {table_name}) AS {alias} ON {left_key} = {alias}.{ref_key}"
+                        modified_sql = modified_sql.replace(full_match, new_join)
             except Exception:
                 continue
         
@@ -333,15 +324,16 @@ class Agent:
             
             action_type = action.get("type", "answer")
             
-            # Всё выполнено
+            # type='done' завершает цикл
             if action_type == "done":
                 break
             
-            # Нужна информация
+            # type='question' - собираем результат и завершаем
             if action_type == "question":
                 reply = action.get("content", "")
-                self.memory.add_message("assistant", reply)
-                return reply
+                all_results.append(reply)
+                executed_steps.append("Задан вопрос пользователю")
+                break
             
             # Файловые операции
             if action_type == "fs":
@@ -353,8 +345,6 @@ class Agent:
                 except Exception as e:
                     last_error = str(e)
                     feedback = last_error
-                    continue
-                # Продолжаем выполнять следующие шаги
                 continue
             
             # SQL
@@ -364,10 +354,10 @@ class Agent:
                     last_error = "SQL missing"
                     feedback = last_error
                     continue
+                
                 if not cfg.is_complete():
-                    reply = "Нет настроек БД. Запусти команду config."
-                    self.memory.add_message("assistant", reply)
-                    return reply
+                    all_results.append("Нет настроек БД. Запусти команду config.")
+                    break
                 
                 engine = get_engine(DBConfig(cfg.user_id, cfg.host, cfg.port, cfg.base))
                 ok, err = validate_sql(engine, sql_text)
@@ -398,18 +388,17 @@ class Agent:
                 else:
                     # Только показать SQL без выполнения
                     reply = f"**SQL:**\n```sql\n{sql_text}\n```"
-                    executed_steps.append(f"Показан SQL (без выполнения)")
+                    executed_steps.append("Показан SQL (без выполнения)")
                     all_results.append(reply)
                 
-                # Продолжаем
                 continue
             
-            # Обычный ответ
+            # Обычный ответ (type='answer' или другие)
             reply = action.get("content", "")
             executed_steps.append("Ответ пользователю")
             all_results.append(reply)
         
-        # Формируем итоговый ответ
+        # Формируем итоговый ответ ПОСЛЕ цикла
         if all_results:
             final_reply = "\n\n---\n\n".join(all_results)
             self.memory.add_message("assistant", final_reply)
