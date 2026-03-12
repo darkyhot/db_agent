@@ -151,10 +151,7 @@ class Agent:
             "- Проверяй существование полей в схеме\n"
             "- Не преобразовывай даты если поле уже в нужном формате\n"
             "- Не делай JOIN если данные уже нормализованы\n"
-            "- **ВАЖНО: При JOIN справочников используй подзапрос с DISTINCT:**\n"
-            "  SELECT ... FROM table t\n"
-            "  JOIN (SELECT DISTINCT gosb_id, gosb_name FROM dim_gosb) d ON t.gosb_id = d.gosb_id\n"
-            "  Это предотвращает дублирование строк при множественных совпадениях\n"
+            "- При JOIN справочников: система автоматически проверит дубликаты\n"
             "- Для агрегации по месяцу: GROUP BY поле_месяц (без DATE_TRUNC)\n"
             "- При неуверенности смотри описание поля в схеме\n\n"}
         # ... truncated for brevity
@@ -195,6 +192,59 @@ class Agent:
                 results.append("\n".join(self.fs.ls(path)))
         return results
 
+    def _check_and_deduplicate_joins(self, sql_text: str, engine) -> str:
+        """Проверяет JOIN на дубликаты и автоматически добавляет DISTINCT если нужно."""
+        import re
+        # Находим все JOIN table ON condition
+        join_pattern = r'JOIN\s+(\w+\.\w+|\w+)\s+(?:AS\s+)?(\w+)?\s*ON\s+([^\s]+)\s*=\s*([^\s]+)'
+        matches = list(re.finditer(join_pattern, sql_text, re.IGNORECASE))
+        
+        if not matches:
+            return sql_text
+        
+        modified_sql = sql_text
+        for match in matches:
+            full_match = match.group(0)
+            table_name = match.group(1)
+            alias = match.group(2) or table_name.split('.')[-1][0].lower()
+            left_key = match.group(3)
+            right_key = match.group(4)
+            
+            # Определяем ключ в справочнике (обычно правый)
+            if '.' in right_key:
+                ref_key = right_key.split('.')[-1]
+            else:
+                ref_key = right_key
+            
+            try:
+                with engine.connect() as conn:
+                    # Проверяем есть ли дубликаты в ключе справочника
+                    check_sql = f"""
+                        SELECT COUNT(*) as total, COUNT(DISTINCT {ref_key}) as unique_count 
+                        FROM {table_name}
+                    """
+                    result = conn.execute(text(check_sql))
+                    row = result.fetchone()
+                    total, unique = row[0], row[1]
+                    
+                    if total != unique:
+                        # Есть дубликаты! Нужно обернуть в подзапрос
+                        # Получаем все колонки справочника
+                        cols_result = conn.execute(text(f"SELECT * FROM {table_name} LIMIT 0"))
+                        all_cols = cols_result.keys()
+                        
+                        # Создаем подзапрос с DISTINCT
+                        distinct_sql = f"(SELECT DISTINCT {ref_key}, {', '.join([c for c in all_cols if c != ref_key])} FROM {table_name})"
+                        
+                        # Заменяем в SQL
+                        old_join = full_match
+                        new_join = f"JOIN {distinct_sql} AS {alias} ON {left_key} = {alias}.{ref_key}"
+                        modified_sql = modified_sql.replace(old_join, new_join)
+            except Exception:
+                continue
+        
+        return modified_sql
+
     def _execute_sql(self, sql_text: str, show_sql: bool, output_file: Optional[str]) -> Tuple[str, str]:
         """Выполняет SQL, возвращает (reply, error)."""
         cfg = self.config_store.load()
@@ -202,6 +252,12 @@ class Agent:
             return "Нет настроек БД. Запусти команду config.", ""
         
         engine = get_engine(DBConfig(cfg.user_id, cfg.host, cfg.port, cfg.base))
+        
+        # Автоматическая дедупликация JOIN перед выполнением
+        original_sql = sql_text
+        sql_text = self._check_and_deduplicate_joins(sql_text, engine)
+        dedup_applied = (original_sql != sql_text)
+        
         try:
             with engine.connect() as conn:
                 result = conn.execute(text(sql_text))
@@ -226,12 +282,14 @@ class Agent:
                     if row_count > 20:
                         preview += f"\n... и ещё {row_count - 20} записей"
                     
-                    reply = f"Найдено {row_count} записей.{file_note}\n\n```\n{preview}\n```"
+                    dedup_note = "\n⚠️ Автоматически исправлен JOIN (были дубликаты в справочнике)" if dedup_applied else ""
+                    reply = f"Найдено {row_count} записей.{dedup_note}{file_note}\n\n```\n{preview}\n```"
                 else:
                     reply = "✅ SQL выполнен (изменение данных)."
                 
                 if show_sql:
-                    reply = reply + f"\n\n**SQL:**\n```sql\n{sql_text}\n```"
+                    display_sql = sql_text if not dedup_applied else f"-- Исправленный SQL:\n{sql_text}\n\n-- Оригинальный SQL:\n{original_sql}"
+                    reply = reply + f"\n\n**SQL:**\n```sql\n{display_sql}\n```"
                 
                 return reply, ""
         except Exception as e:
